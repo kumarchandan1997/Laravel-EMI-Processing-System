@@ -30,7 +30,7 @@ This project implements an EMI (Equated Monthly Installment) processing system u
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/yourname/laravel-emi-processing.git
+git clone https://github.com/kumarchandan1997/Laravel-EMI-Processing-System.git
 cd laravel-emi-processing
 composer install
 npm install
@@ -40,5 +40,4 @@ php artisan migrate --seed
 php artisan serve
 
 Username: developer
-
 Password: Test@Password123#
