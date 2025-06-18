@@ -16,5 +16,3 @@ Route::middleware('auth')->group(function () {
     Route::get('/process-emi', [EmiController::class, 'processEmi'])->name('emi.process');
     Route::get('/emi-details', [EmiController::class, 'showEmiDetails'])->name('emi.details');
 });
-
-Route::get('/home', [App\Http\Controllers\HomeController::class, 'index'])->name('home');
