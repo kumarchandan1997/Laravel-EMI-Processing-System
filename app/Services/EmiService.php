@@ -3,83 +3,161 @@
 namespace App\Services;
 
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Cache;
 use Carbon\Carbon;
 use App\Repositories\LoanRepository;
-use Illuminate\Support\Facades\Log;
-
+use Exception;
 
 class EmiService
 {
-    protected $loanRepo;
+    protected LoanRepository $loanRepo;
 
     public function __construct(LoanRepository $loanRepo)
     {
         $this->loanRepo = $loanRepo;
     }
 
-        public function processEmiData()
-       {
-
+    public function processEmiData(): void
+    {
         try {
-            // Step 1: Drop and recreate emi_details table
-            DB::statement('DROP TABLE IF EXISTS emi_details');
+            $columns = $this->generateMonthColumns();
 
-            $minDate = Carbon::parse($this->loanRepo->getMinStartDate())->startOfMonth();
-            $maxDate = Carbon::parse($this->loanRepo->getMaxEndDate())->startOfMonth();
-
-            $columns = [];
-            while ($minDate <= $maxDate) {
-                $columns[] = $minDate->format('Y_M');
-                $minDate->addMonth();
+            if (empty($columns)) {
+                Log::warning('No columns generated. Aborting EMI data processing.');
+                return;
             }
 
-            $columnSql = "`id` INT AUTO_INCREMENT PRIMARY KEY, `clientid` INT";
-            foreach ($columns as $col) {
-                $columnSql .= ", `$col` DECIMAL(10,2) DEFAULT 0.00";
-            }
+            $this->rebuildEmiDetailsTable($columns);
+            $this->insertEmiRecords($columns);
 
-            DB::statement("CREATE TABLE emi_details ($columnSql)");
+            Cache::forget('emi_details.all');
 
-            foreach ($this->loanRepo->getAllForEmiProcessing() as $loan) {
-                $monthlyEmi = round($loan->loan_amount / $loan->num_of_payment, 2);
-                $totalBeforeLast = $monthlyEmi * ($loan->num_of_payment - 1);
-                $lastEmi = round($loan->loan_amount - $totalBeforeLast, 2);
-
-                $currentDate = Carbon::parse($loan->first_payment_date)->startOfMonth();
-                $values = array_fill_keys($columns, 0.00);
-
-                for ($i = 0; $i < $loan->num_of_payment; $i++) {
-                    $col = $currentDate->format('Y_M');
-                    $values[$col] = $i == $loan->num_of_payment - 1 ? $lastEmi : $monthlyEmi;
-                    $currentDate->addMonth();
-                }
-
-                $colNames = '`clientid`, ' . implode(', ', array_map(fn($k) => "`$k`", array_keys($values)));
-                $colValues = array_merge([$loan->clientid], array_values($values));
-                $placeholders = implode(', ', array_fill(0, count($colValues), '?'));
-
-                DB::insert("INSERT INTO emi_details ($colNames) VALUES ($placeholders)", $colValues);
-            }
             Log::info('EMI data processed successfully.');
 
-        } catch (\Exception $e) {
-            Log::error('EMI Processing Error: ' . $e->getMessage());
+        } catch (Exception $e) {
+            Log::error('EMI Processing Error', [
+                'message' => $e->getMessage(),
+                'trace' => $e->getTraceAsString(),
+            ]);
             throw $e;
         }
     }
 
-    public function getEmiData()
+    public function getEmiData(): \Illuminate\Support\Collection
     {
-        return DB::table('emi_details')->get();
+        try {
+            return DB::table('emi_details')->get();
+        } catch (Exception $e) {
+            Log::error('Failed to retrieve EMI data', [
+                'message' => $e->getMessage(),
+                'trace' => $e->getTraceAsString(),
+            ]);
+            return collect();
+        }
     }
 
-    public function getEmiColumns()
+
+    public function getEmiColumns(): array
     {
-        $columns = DB::select("SHOW COLUMNS FROM emi_details");
-        return array_map(fn($col) => $col->Field, $columns);
+        try {
+            $columns = DB::select("SHOW COLUMNS FROM emi_details");
+            return array_map(fn($col) => $col->Field, $columns);
+        } catch (Exception $e) {
+            Log::error('Failed to fetch EMI columns', [
+                'message' => $e->getMessage(),
+            ]);
+            return [];
+        }
+    }
+
+    private function generateMonthColumns(): array
+    {
+        $start = $this->loanRepo->getMinStartDate();
+        $end = $this->loanRepo->getMaxEndDate();
+
+        if (!$start || !$end) {
+            Log::warning('Missing loan data: cannot determine date range.');
+            return [];
+        }
+
+        $start = Carbon::parse($start)->startOfMonth();
+        $end = Carbon::parse($end)->startOfMonth();
+
+        $columns = [];
+
+        while ($start <= $end) {
+            $columns[] = $start->format('Y_M');
+            $start->addMonth();
+        }
+
+        return $columns;
+    }
+
+    /**
+     * Drops and recreates the emi_details table with dynamic month columns.
+     */
+    private function rebuildEmiDetailsTable(array $columns): void
+    {
+        DB::statement('DROP TABLE IF EXISTS emi_details');
+
+        $baseColumns = [
+            "`id` INT AUTO_INCREMENT PRIMARY KEY",
+            "`clientid` INT NOT NULL"
+        ];
+
+        $monthColumns = array_map(fn($col) => "`$col` DECIMAL(10,2) NOT NULL DEFAULT 0.00", $columns);
+
+        $sql = implode(", ", array_merge($baseColumns, $monthColumns));
+
+        DB::statement("CREATE TABLE emi_details ($sql) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
+    }
+
+    /**
+     * Calculate EMI values and bulk insert into emi_details table.
+     */
+    private function insertEmiRecords(array $columns): void
+    {
+        $columnsList = '`clientid`, ' . implode(', ', array_map(fn($col) => "`$col`", $columns));
+        $placeholders = implode(', ', array_fill(0, count($columns) + 1, '?'));
+
+        $this->loanRepo->chunkForEmiProcessing(500, function ($loans) use ($columns, $columnsList, $placeholders) {
+            foreach ($loans as $loan) {
+                $emiValues = $this->calculateEmiDistribution($loan, $columns);
+
+                $values = array_merge([$loan->clientid], array_values($emiValues));
+
+                // Safe, sanitized insert
+                DB::insert("INSERT INTO emi_details ($columnsList) VALUES ($placeholders)", $values);
+            }
+        });
+    }
+
+
+    /**
+     * Split EMI amount into monthly buckets based on payment schedule.
+     */
+    private function calculateEmiDistribution(object $loan, array $allColumns): array
+    {
+        $emi = round($loan->loan_amount / $loan->num_of_payment, 2);
+        $totalBeforeLast = $emi * ($loan->num_of_payment - 1);
+        $lastEmi = round($loan->loan_amount - $totalBeforeLast, 2);
+
+        $distribution = array_fill_keys($allColumns, 0.00);
+        $current = Carbon::parse($loan->first_payment_date)->startOfMonth();
+
+        for ($i = 0; $i < $loan->num_of_payment; $i++) {
+            $column = $current->format('Y_M');
+
+            if (!isset($distribution[$column])) {
+                Log::warning("Missing column $column for client ID {$loan->clientid}");
+            } else {
+                $distribution[$column] = ($i === $loan->num_of_payment - 1) ? $lastEmi : $emi;
+            }
+
+            $current->addMonth();
+        }
+
+        return $distribution;
     }
 }
-
-
-
-?>

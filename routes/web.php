@@ -2,6 +2,7 @@
 
 use Illuminate\Support\Facades\Route;
 use App\Http\Controllers\EmiController;
+use App\Http\Controllers\HomeController;
 
 
 
@@ -16,3 +17,6 @@ Route::middleware('auth')->group(function () {
     Route::get('/process-emi', [EmiController::class, 'processEmi'])->name('emi.process');
     Route::get('/emi-details', [EmiController::class, 'showEmiDetails'])->name('emi.details');
 });
+
+
+Route::get('/home', [HomeController::class, 'index'])->name('home');
